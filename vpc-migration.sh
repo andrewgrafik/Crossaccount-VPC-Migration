@@ -194,7 +194,11 @@ TGW_COUNT=$(echo "$TGW_ATTACHMENTS" | grep -c . || echo 0)
 echo "Found:"
 echo "  - Subnets: $SUBNET_COUNT"
 echo "  - Route Tables: $RT_COUNT"
-echo "  - Internet Gateway: $([ -n "$IGW" ] && echo "Yes ($IGW)" || echo "No")"
+if [ -n "$IGW" ] && [ "$IGW" != "None" ]; then
+    echo "  - Internet Gateway: Yes ($IGW)"
+else
+    echo "  - Internet Gateway: No"
+fi
 echo "  - NAT Gateways: $NAT_COUNT"
 echo "  - VPC Endpoints: $ENDPOINT_COUNT"
 echo "  - NACLs: $NACL_COUNT"
@@ -499,10 +503,18 @@ echo "Target VPC: $TARGET_VPC_ID"
 echo "Target CIDR: $TARGET_VPC_CIDR"
 echo "Subnets: $SUBNET_COUNT"
 echo "Route Tables: $RT_COUNT"
-[ -n "$TARGET_IGW" ] && echo "Internet Gateway: $TARGET_IGW"
-[ $NAT_COUNT -gt 0 ] && echo "NAT Gateways: $NAT_COUNT"
-[ $ENDPOINT_COUNT -gt 0 ] && echo "VPC Endpoints: $ENDPOINT_COUNT"
-[ $NACL_COUNT -gt 0 ] && echo "NACLs: $NACL_COUNT"
+if [ -n "$TARGET_IGW" ]; then
+    echo "Internet Gateway: $TARGET_IGW"
+fi
+if [ "$NAT_COUNT" -gt 0 ]; then
+    echo "NAT Gateways: $NAT_COUNT"
+fi
+if [ "$ENDPOINT_COUNT" -gt 0 ]; then
+    echo "VPC Endpoints: $ENDPOINT_COUNT"
+fi
+if [ "$NACL_COUNT" -gt 0 ]; then
+    echo "NACLs: $NACL_COUNT"
+fi
 echo
 echo -e "${YELLOW}IMPORTANT: Rotate the AWS credentials used in this migration${NC}"
 echo
