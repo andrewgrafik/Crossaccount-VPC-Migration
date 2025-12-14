@@ -171,12 +171,35 @@ VPC_ENDPOINTS=$(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$SO
     --query 'VpcEndpoints[*].[VpcEndpointId,ServiceName,VpcEndpointType]' --output text)
 ENDPOINT_COUNT=$(echo "$VPC_ENDPOINTS" | grep -c . || echo 0)
 
+# NACLs
+NACLS=$(aws ec2 describe-network-acls --filters "Name=vpc-id,Values=$SOURCE_VPC_ID" "Name=default,Values=false" \
+    --profile source-account --region $SOURCE_REGION \
+    --query 'NetworkAcls[*].NetworkAclId' --output text)
+NACL_COUNT=$(echo "$NACLS" | wc -w)
+
+# VPC Peering
+PEERINGS=$(aws ec2 describe-vpc-peering-connections \
+    --filters "Name=requester-vpc-info.vpc-id,Values=$SOURCE_VPC_ID" "Name=status-code,Values=active" \
+    --profile source-account --region $SOURCE_REGION \
+    --query 'VpcPeeringConnections[*].[VpcPeeringConnectionId,AccepterVpcInfo.VpcId,AccepterVpcInfo.OwnerId]' --output text 2>/dev/null || echo "")
+PEERING_COUNT=$(echo "$PEERINGS" | grep -c . || echo 0)
+
+# Transit Gateway Attachments
+TGW_ATTACHMENTS=$(aws ec2 describe-transit-gateway-vpc-attachments \
+    --filters "Name=vpc-id,Values=$SOURCE_VPC_ID" "Name=state,Values=available" \
+    --profile source-account --region $SOURCE_REGION \
+    --query 'TransitGatewayVpcAttachments[*].[TransitGatewayAttachmentId,TransitGatewayId]' --output text 2>/dev/null || echo "")
+TGW_COUNT=$(echo "$TGW_ATTACHMENTS" | grep -c . || echo 0)
+
 echo "Found:"
 echo "  - Subnets: $SUBNET_COUNT"
 echo "  - Route Tables: $RT_COUNT"
 echo "  - Internet Gateway: $([ -n "$IGW" ] && echo "Yes ($IGW)" || echo "No")"
 echo "  - NAT Gateways: $NAT_COUNT"
 echo "  - VPC Endpoints: $ENDPOINT_COUNT"
+echo "  - NACLs: $NACL_COUNT"
+echo "  - VPC Peerings: $PEERING_COUNT"
+echo "  - Transit Gateway Attachments: $TGW_COUNT"
 echo
 
 # Step 6: Migration Summary
@@ -370,6 +393,103 @@ if [ $ENDPOINT_COUNT -gt 0 ]; then
     echo -e "${GREEN}✓ VPC endpoints created${NC}"
 fi
 
+# Step 13: Create NACLs
+if [ $NACL_COUNT -gt 0 ]; then
+    echo "Creating Network ACLs..."
+    declare -A NACL_MAP
+    
+    for nacl_id in $NACLS; do
+        TARGET_NACL=$(aws ec2 create-network-acl --vpc-id $TARGET_VPC_ID \
+            --profile target-account --region $TARGET_REGION \
+            --query 'NetworkAcl.NetworkAclId' --output text)
+        
+        NACL_MAP[$nacl_id]=$TARGET_NACL
+        
+        # Copy inbound rules
+        INBOUND=$(aws ec2 describe-network-acls --network-acl-ids $nacl_id \
+            --profile source-account --region $SOURCE_REGION \
+            --query 'NetworkAcls[0].Entries[?Egress==`false`].[RuleNumber,Protocol,RuleAction,CidrBlock,PortRange.From,PortRange.To]' --output text)
+        
+        while IFS=$'\t' read -r rule_num protocol action cidr from_port to_port; do
+            [ -z "$rule_num" ] || [ "$rule_num" = "32767" ] && continue
+            [ "$protocol" = "-1" ] && protocol="all"
+            
+            if [ -n "$from_port" ] && [ -n "$to_port" ]; then
+                aws ec2 create-network-acl-entry --network-acl-id $TARGET_NACL --rule-number $rule_num \
+                    --protocol $protocol --rule-action $action --cidr-block $cidr \
+                    --port-range From=$from_port,To=$to_port \
+                    --profile target-account --region $TARGET_REGION 2>/dev/null || true
+            else
+                aws ec2 create-network-acl-entry --network-acl-id $TARGET_NACL --rule-number $rule_num \
+                    --protocol $protocol --rule-action $action --cidr-block $cidr \
+                    --profile target-account --region $TARGET_REGION 2>/dev/null || true
+            fi
+        done <<< "$INBOUND"
+        
+        # Copy outbound rules
+        OUTBOUND=$(aws ec2 describe-network-acls --network-acl-ids $nacl_id \
+            --profile source-account --region $SOURCE_REGION \
+            --query 'NetworkAcls[0].Entries[?Egress==`true`].[RuleNumber,Protocol,RuleAction,CidrBlock,PortRange.From,PortRange.To]' --output text)
+        
+        while IFS=$'\t' read -r rule_num protocol action cidr from_port to_port; do
+            [ -z "$rule_num" ] || [ "$rule_num" = "32767" ] && continue
+            [ "$protocol" = "-1" ] && protocol="all"
+            
+            if [ -n "$from_port" ] && [ -n "$to_port" ]; then
+                aws ec2 create-network-acl-entry --network-acl-id $TARGET_NACL --rule-number $rule_num \
+                    --protocol $protocol --rule-action $action --cidr-block $cidr --egress \
+                    --port-range From=$from_port,To=$to_port \
+                    --profile target-account --region $TARGET_REGION 2>/dev/null || true
+            else
+                aws ec2 create-network-acl-entry --network-acl-id $TARGET_NACL --rule-number $rule_num \
+                    --protocol $protocol --rule-action $action --cidr-block $cidr --egress \
+                    --profile target-account --region $TARGET_REGION 2>/dev/null || true
+            fi
+        done <<< "$OUTBOUND"
+        
+        # Associate with subnets
+        NACL_SUBNETS=$(aws ec2 describe-network-acls --network-acl-ids $nacl_id \
+            --profile source-account --region $SOURCE_REGION \
+            --query 'NetworkAcls[0].Associations[*].SubnetId' --output text)
+        
+        for subnet in $NACL_SUBNETS; do
+            TARGET_SUBNET=${SUBNET_MAP[$subnet]}
+            [ -n "$TARGET_SUBNET" ] && aws ec2 replace-network-acl-association \
+                --association-id $(aws ec2 describe-network-acls --filters "Name=association.subnet-id,Values=$TARGET_SUBNET" \
+                    --profile target-account --region $TARGET_REGION \
+                    --query 'NetworkAcls[0].Associations[?SubnetId==`'$TARGET_SUBNET'`].NetworkAclAssociationId' --output text) \
+                --network-acl-id $TARGET_NACL \
+                --profile target-account --region $TARGET_REGION 2>/dev/null || true
+        done
+        
+        echo "  ✓ $nacl_id → $TARGET_NACL"
+    done
+    
+    echo -e "${GREEN}✓ NACLs created${NC}"
+fi
+
+# Step 14: VPC Peering (informational only)
+if [ $PEERING_COUNT -gt 0 ]; then
+    echo -e "${YELLOW}Note: VPC Peering connections detected${NC}"
+    echo "VPC peering must be manually recreated after migration:"
+    while IFS=$'\t' read -r pcx_id peer_vpc peer_account; do
+        [ -z "$pcx_id" ] && continue
+        echo "  - $pcx_id → Peer VPC: $peer_vpc (Account: $peer_account)"
+    done <<< "$PEERINGS"
+    echo
+fi
+
+# Step 15: Transit Gateway (informational only)
+if [ $TGW_COUNT -gt 0 ]; then
+    echo -e "${YELLOW}Note: Transit Gateway attachments detected${NC}"
+    echo "Transit Gateway attachments must be manually recreated:"
+    while IFS=$'\t' read -r attach_id tgw_id; do
+        [ -z "$attach_id" ] && continue
+        echo "  - Attachment: $attach_id → TGW: $tgw_id"
+    done <<< "$TGW_ATTACHMENTS"
+    echo
+fi
+
 echo
 echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║      VPC Migration Completed Successfully!    ║${NC}"
@@ -382,6 +502,7 @@ echo "Route Tables: $RT_COUNT"
 [ -n "$TARGET_IGW" ] && echo "Internet Gateway: $TARGET_IGW"
 [ $NAT_COUNT -gt 0 ] && echo "NAT Gateways: $NAT_COUNT"
 [ $ENDPOINT_COUNT -gt 0 ] && echo "VPC Endpoints: $ENDPOINT_COUNT"
+[ $NACL_COUNT -gt 0 ] && echo "NACLs: $NACL_COUNT"
 echo
 echo -e "${YELLOW}IMPORTANT: Rotate the AWS credentials used in this migration${NC}"
 echo
