@@ -163,13 +163,15 @@ IGW=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Value
 NAT_GWS=$(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$SOURCE_VPC_ID" "Name=state,Values=available" \
     --profile source-account --region $SOURCE_REGION \
     --query 'NatGateways[*].[NatGatewayId,SubnetId]' --output text)
-NAT_COUNT=$(echo "$NAT_GWS" | grep -c . || echo 0)
+NAT_COUNT=$(echo "$NAT_GWS" | grep -c . 2>/dev/null || echo 0)
+[ -z "$NAT_GWS" ] && NAT_COUNT=0
 
 # VPC Endpoints
 VPC_ENDPOINTS=$(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$SOURCE_VPC_ID" \
     --profile source-account --region $SOURCE_REGION \
     --query 'VpcEndpoints[*].[VpcEndpointId,ServiceName,VpcEndpointType]' --output text)
-ENDPOINT_COUNT=$(echo "$VPC_ENDPOINTS" | grep -c . || echo 0)
+ENDPOINT_COUNT=$(echo "$VPC_ENDPOINTS" | grep -c . 2>/dev/null || echo 0)
+[ -z "$VPC_ENDPOINTS" ] && ENDPOINT_COUNT=0
 
 # NACLs
 NACLS=$(aws ec2 describe-network-acls --filters "Name=vpc-id,Values=$SOURCE_VPC_ID" "Name=default,Values=false" \
@@ -182,14 +184,16 @@ PEERINGS=$(aws ec2 describe-vpc-peering-connections \
     --filters "Name=requester-vpc-info.vpc-id,Values=$SOURCE_VPC_ID" "Name=status-code,Values=active" \
     --profile source-account --region $SOURCE_REGION \
     --query 'VpcPeeringConnections[*].[VpcPeeringConnectionId,AccepterVpcInfo.VpcId,AccepterVpcInfo.OwnerId]' --output text 2>/dev/null || echo "")
-PEERING_COUNT=$(echo "$PEERINGS" | grep -c . || echo 0)
+PEERING_COUNT=$(echo "$PEERINGS" | grep -c . 2>/dev/null || echo 0)
+[ -z "$PEERINGS" ] && PEERING_COUNT=0
 
 # Transit Gateway Attachments
 TGW_ATTACHMENTS=$(aws ec2 describe-transit-gateway-vpc-attachments \
     --filters "Name=vpc-id,Values=$SOURCE_VPC_ID" "Name=state,Values=available" \
     --profile source-account --region $SOURCE_REGION \
     --query 'TransitGatewayVpcAttachments[*].[TransitGatewayAttachmentId,TransitGatewayId]' --output text 2>/dev/null || echo "")
-TGW_COUNT=$(echo "$TGW_ATTACHMENTS" | grep -c . || echo 0)
+TGW_COUNT=$(echo "$TGW_ATTACHMENTS" | grep -c . 2>/dev/null || echo 0)
+[ -z "$TGW_ATTACHMENTS" ] && TGW_COUNT=0
 
 echo "Found:"
 echo "  - Subnets: $SUBNET_COUNT"
@@ -325,7 +329,7 @@ for rt_id in $ROUTE_TABLES; do
         --profile source-account --region $SOURCE_REGION \
         --query 'RouteTables[0].Associations[?Main==`true`]|[0].Main' --output text)
     
-    if [ "$IS_MAIN" = "True" ]; then
+    if [ "$IS_MAIN" = "True" ] || [ "$IS_MAIN" = "true" ]; then
         # Use VPC's main route table
         TARGET_RT=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$TARGET_VPC_ID" "Name=association.main,Values=true" \
             --profile target-account --region $TARGET_REGION \
@@ -373,7 +377,7 @@ done
 echo -e "${GREEN}✓ Route tables created${NC}"
 
 # Step 12: Create VPC Endpoints
-if [ $ENDPOINT_COUNT -gt 0 ]; then
+if [ "$ENDPOINT_COUNT" -gt 0 ] 2>/dev/null; then
     echo "Creating VPC endpoints..."
     
     while IFS=$'\t' read -r ep_id service_name ep_type; do
@@ -398,7 +402,7 @@ if [ $ENDPOINT_COUNT -gt 0 ]; then
 fi
 
 # Step 13: Create NACLs
-if [ $NACL_COUNT -gt 0 ]; then
+if [ "$NACL_COUNT" -gt 0 ] 2>/dev/null; then
     echo "Creating Network ACLs..."
     declare -A NACL_MAP
     
@@ -473,7 +477,7 @@ if [ $NACL_COUNT -gt 0 ]; then
 fi
 
 # Step 14: VPC Peering (informational only)
-if [ $PEERING_COUNT -gt 0 ]; then
+if [ "$PEERING_COUNT" -gt 0 ] 2>/dev/null; then
     echo -e "${YELLOW}Note: VPC Peering connections detected${NC}"
     echo "VPC peering must be manually recreated after migration:"
     while IFS=$'\t' read -r pcx_id peer_vpc peer_account; do
@@ -484,7 +488,7 @@ if [ $PEERING_COUNT -gt 0 ]; then
 fi
 
 # Step 15: Transit Gateway (informational only)
-if [ $TGW_COUNT -gt 0 ]; then
+if [ "$TGW_COUNT" -gt 0 ] 2>/dev/null; then
     echo -e "${YELLOW}Note: Transit Gateway attachments detected${NC}"
     echo "Transit Gateway attachments must be manually recreated:"
     while IFS=$'\t' read -r attach_id tgw_id; do
@@ -506,7 +510,7 @@ echo "Route Tables: $RT_COUNT"
 if [ -n "$TARGET_IGW" ]; then
     echo "Internet Gateway: $TARGET_IGW"
 fi
-if [ "$NAT_COUNT" -gt 0 ]; then
+if [ "$NAT_COUNT" -gt 0 ] 2>/dev/null; then
     echo "NAT Gateways: $NAT_COUNT"
 fi
 if [ "$ENDPOINT_COUNT" -gt 0 ]; then
